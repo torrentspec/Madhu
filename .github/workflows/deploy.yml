@@ -22,11 +22,13 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Setup Gradle Wrapper Engine
+      - name: Force-Generate Clean Gradle Wrapper
         run: |
-          if [ ! -f "gradlew" ]; then
-            gradle wrapper --gradle-version 8.5
-          fi
+          # Destroy any lingering corrupted files from previous checkouts
+          rm -rf gradle/ gradlew gradlew.bat
+          
+          # Force the cloud server to generate a pristine, uncorrupted binary engine
+          gradle wrapper --gradle-version 8.5
           chmod +x gradlew
 
       - name: Decode and Reconstruct Keystore File
@@ -43,20 +45,16 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          # 1. Dynamically locate the newest Android Build Tools installed on the server
           BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | sort -V | tail -n 1)
           echo "Using Build Tools from: $BUILD_TOOLS"
           
-          # 2. Locate the raw, unsigned APK built by Gradle
           UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*-unsigned.apk" | head -n 1)
           ALIGNED_APK="${UNSIGNED_APK/-unsigned/-aligned}"
           SIGNED_APK="${UNSIGNED_APK/-unsigned/-signed}"
           
-          # 3. Optimize the APK alignment
           echo "Aligning APK..."
           $BUILD_TOOLS/zipalign -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
           
-          # 4. Cryptographically sign the APK with your Keystore
           echo "Signing APK..."
           $BUILD_TOOLS/apksigner sign \
             --ks app/madhu-release.jks \
@@ -65,7 +63,6 @@ jobs:
             --key-pass pass:"$RELEASE_KEY_PASSWORD" \
             --out "$SIGNED_APK" "$ALIGNED_APK"
             
-          # 5. Save the final file path for the upload step
           echo "SIGNED_APK_PATH=$SIGNED_APK" >> $GITHUB_ENV
 
       - name: Upload Signed Production Build
