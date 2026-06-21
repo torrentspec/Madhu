@@ -1,0 +1,136 @@
+package com.foss.madhu.data.model
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Core domain models — pure Kotlin data classes, zero Android dependencies.
+// ──────────────────────────────────────────────────────────────────────────────
+
+data class Song(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val albumId: String,
+    val albumArtUrl: String,
+    val durationSeconds: Int,
+    /** DES-encrypted media URL returned directly from the JioSaavn API. */
+    val encryptedMediaUrl: String,
+    val genre: String       = "",
+    val language: String    = "",
+    val hasLyrics: Boolean  = false,
+    val lyricsId: String    = "",
+    val is320kbps: Boolean  = false,
+    val year: String        = ""
+) {
+    /** Promote the thumbnail URL to 500×500 for the Now Playing full-bleed art. */
+    fun highResArtUrl(): String = albumArtUrl
+        .replace("http://", "https://")
+        .replace("_50x50.jpg",   "_500x500.jpg")
+        .replace("_150x150.jpg", "_500x500.jpg")
+
+    /** Human-readable duration string MM:SS used in the queue list. */
+    fun formattedDuration(): String {
+        val m = durationSeconds / 60
+        val s = durationSeconds % 60
+        return "%d:%02d".format(m, s)
+    }
+}
+
+// ── Lyrics ────────────────────────────────────────────────────────────────────
+
+data class LyricsLine(
+    /** Absolute playback position in milliseconds for this line. */
+    val timestampMs: Long,
+    val text: String
+)
+
+data class Lyrics(
+    val songId: String,
+    val lines: List<LyricsLine>,
+    /** True when every line carries a valid LRC timestamp. */
+    val isTimeSynced: Boolean
+)
+
+// ── Streaming quality ─────────────────────────────────────────────────────────
+
+enum class StreamQuality(
+    val displayName: String,
+    val subtitle: String,
+    /** Suffix appended to the decrypted CDN base URL to select the quality tier. */
+    val urlSuffix: String,
+    val bitrateKbps: Int
+) {
+    AUTO(
+        displayName  = "Auto",
+        subtitle     = "Intelligently balances audio quality and data usage based on your current network speed.",
+        urlSuffix    = "_160.mp4",    // default; runtime switching overrides this
+        bitrateKbps  = 160
+    ),
+    DATA_SAVER(
+        displayName  = "Data Saver",
+        subtitle     = "Caps stream at 96 kbps. Ideal for saving cellular data or weak network connections.",
+        urlSuffix    = "_96.mp4",
+        bitrateKbps  = 96
+    ),
+    HI_FIDELITY(
+        displayName  = "Hi-Fidelity",
+        subtitle     = "Forces uncompressed 320 kbps pristine audio. Recommended for Wi-Fi or high-end headphones.",
+        urlSuffix    = "_320.mp4",
+        bitrateKbps  = 320
+    );
+
+    /** Codec label shown in the Now Playing bitrate badge. JioSaavn serves AAC in MP4. */
+    val codecLabel: String get() = "AAC"
+
+    /** Badge string rendered in the Now Playing screen: e.g. "320 kbps • AAC". */
+    fun bitrateLabel(): String = "${bitrateKbps} kbps • $codecLabel"
+}
+
+// ── EQ preset identity (display metadata lives in AudioEffectManager) ─────────
+
+enum class EqPreset(val displayName: String, val description: String) {
+    OFF(
+        displayName = "Off",
+        description = "Bypass the equalizer entirely; signal passes through unmodified."
+    ),
+    STUDIO_CLEAN(
+        displayName = "Studio Clean",
+        description = "Ultra-transparent clinical reference tracking curve. Ruler-flat for critical listening."
+    ),
+    WARM_TUBE(
+        displayName = "Warm Tube",
+        description = "Slight lower-mid harmonic hump with rolled-off peak highs — analogue warmth without mud."
+    ),
+    SUB_BASS_RUMBLE(
+        displayName = "Sub-Bass Rumble",
+        description = "Sub-atomic emphasis at 60 Hz without bleeding into lower vocals. Feels it before you hear it."
+    ),
+    VOCAL_INTIMACY(
+        displayName = "Vocal Intimacy",
+        description = "Pushed high-mids for crisp, front-row acoustic presence. Every breath detail revealed."
+    ),
+    V_SHAPED_SPARKLE(
+        displayName = "V-Shaped Sparkle",
+        description = "Aggressive club profile: punchy low-end kicks paired with extreme 14 kHz crystalline air."
+    ),
+    CUSTOM(
+        displayName = "Custom",
+        description = "Manually adjust each of the 5 frequency bands to your exact preference."
+    )
+}
+
+// ── Playback state snapshot for UI consumption ────────────────────────────────
+
+data class PlaybackState(
+    val isPlaying: Boolean       = false,
+    val isBuffering: Boolean     = false,
+    val currentSong: Song?       = null,
+    val positionMs: Long         = 0L,
+    val durationMs: Long         = 0L,
+    val currentQuality: StreamQuality = StreamQuality.HI_FIDELITY,
+    val bitrateLabel: String     = "",
+    val queue: List<Song>        = emptyList(),
+    val isFavorite: Boolean      = false
+) {
+    val progressFraction: Float
+        get() = if (durationMs > 0) positionMs.toFloat() / durationMs else 0f
+}

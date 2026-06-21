@@ -1,0 +1,176 @@
+package com.foss.madhu.prefs
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import com.foss.madhu.data.model.EqPreset
+import com.foss.madhu.data.model.StreamQuality
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+// Singleton DataStore scoped to Application context.
+private val Context.dataStore: DataStore<Preferences>
+    by preferencesDataStore(name = "madhu_prefs")
+
+class UserPreferences(private val context: Context) {
+
+    // ── Keys ──────────────────────────────────────────────────────────────────
+
+    companion object {
+        val STREAM_QUALITY      = stringPreferencesKey("stream_quality")
+        val EQ_PRESET           = stringPreferencesKey("eq_preset")
+        val CUSTOM_EQ_BANDS     = stringPreferencesKey("custom_eq_bands")  // JSON int-array
+        val CROSSFADE_DURATION  = intPreferencesKey("crossfade_duration_ms")
+        val REPLAY_GAIN_FACTOR  = floatPreferencesKey("replay_gain_factor")
+        val AMOLED_THEME        = booleanPreferencesKey("amoled_theme")
+        val DYNAMIC_COLOR       = booleanPreferencesKey("dynamic_color")
+        val LASTFM_API_KEY      = stringPreferencesKey("lastfm_api_key")
+        val LASTFM_API_SECRET   = stringPreferencesKey("lastfm_api_secret")
+        val LASTFM_SESSION_KEY  = stringPreferencesKey("lastfm_session_key")
+        val LASTFM_USERNAME     = stringPreferencesKey("lastfm_username")
+        val SCROBBLING_ENABLED  = booleanPreferencesKey("scrobbling_enabled")
+        val FAVORITE_IDS        = stringPreferencesKey("favorite_ids")      // JSON string-array
+
+        // Sensible defaults
+        const val DEFAULT_CROSSFADE_MS   = 3000
+        const val DEFAULT_REPLAY_GAIN    = 0.85f  // ≈ −1.4 dBFS normalisation
+    }
+
+    private val store get() = context.dataStore
+
+    // ── Read flows ────────────────────────────────────────────────────────────
+
+    val streamQuality: Flow<StreamQuality> = store.data.catchAndDefault().map { prefs ->
+        runCatching {
+            StreamQuality.valueOf(prefs[STREAM_QUALITY] ?: StreamQuality.HI_FIDELITY.name)
+        }.getOrDefault(StreamQuality.HI_FIDELITY)
+    }
+
+    val eqPreset: Flow<EqPreset> = store.data.catchAndDefault().map { prefs ->
+        runCatching {
+            EqPreset.valueOf(prefs[EQ_PRESET] ?: EqPreset.OFF.name)
+        }.getOrDefault(EqPreset.OFF)
+    }
+
+    val customEqBands: Flow<ShortArray> = store.data.catchAndDefault().map { prefs ->
+        val json = prefs[CUSTOM_EQ_BANDS] ?: return@map ShortArray(5) { 0 }
+        runCatching {
+            Json.decodeFromString<List<Int>>(json).map { it.toShort() }.toShortArray()
+        }.getOrDefault(ShortArray(5) { 0 })
+    }
+
+    val crossfadeDurationMs: Flow<Int> = store.data.catchAndDefault().map { prefs ->
+        prefs[CROSSFADE_DURATION] ?: DEFAULT_CROSSFADE_MS
+    }
+
+    val replayGainFactor: Flow<Float> = store.data.catchAndDefault().map { prefs ->
+        prefs[REPLAY_GAIN_FACTOR] ?: DEFAULT_REPLAY_GAIN
+    }
+
+    val isAmoledTheme: Flow<Boolean> = store.data.catchAndDefault().map { prefs ->
+        prefs[AMOLED_THEME] ?: true   // AMOLED on by default
+    }
+
+    val isDynamicColor: Flow<Boolean> = store.data.catchAndDefault().map { prefs ->
+        prefs[DYNAMIC_COLOR] ?: true
+    }
+
+    val lastFmApiKey: Flow<String> = store.data.catchAndDefault().map { it[LASTFM_API_KEY] ?: "" }
+    val lastFmApiSecret: Flow<String> = store.data.catchAndDefault().map { it[LASTFM_API_SECRET] ?: "" }
+    val lastFmSessionKey: Flow<String> = store.data.catchAndDefault().map { it[LASTFM_SESSION_KEY] ?: "" }
+    val lastFmUsername: Flow<String> = store.data.catchAndDefault().map { it[LASTFM_USERNAME] ?: "" }
+    val scrobblingEnabled: Flow<Boolean> = store.data.catchAndDefault().map { prefs ->
+        prefs[SCROBBLING_ENABLED] ?: false
+    }
+
+    val favoriteIds: Flow<Set<String>> = store.data.catchAndDefault().map { prefs ->
+        val json = prefs[FAVORITE_IDS] ?: return@map emptySet()
+        runCatching {
+            Json.decodeFromString<List<String>>(json).toSet()
+        }.getOrDefault(emptySet())
+    }
+
+    // ── Write helpers ─────────────────────────────────────────────────────────
+
+    suspend fun setStreamQuality(quality: StreamQuality) =
+        store.edit { it[STREAM_QUALITY] = quality.name }
+
+    suspend fun setEqPreset(preset: EqPreset) =
+        store.edit { it[EQ_PRESET] = preset.name }
+
+    suspend fun setCustomEqBands(bands: ShortArray) {
+        val json = Json.encodeToString(bands.map { it.toInt() })
+        store.edit { it[CUSTOM_EQ_BANDS] = json }
+    }
+
+    suspend fun setCrossfadeDuration(ms: Int) =
+        store.edit { it[CROSSFADE_DURATION] = ms }
+
+    suspend fun setReplayGainFactor(factor: Float) =
+        store.edit { it[REPLAY_GAIN_FACTOR] = factor }
+
+    suspend fun setAmoledTheme(enabled: Boolean) =
+        store.edit { it[AMOLED_THEME] = enabled }
+
+    suspend fun setDynamicColor(enabled: Boolean) =
+        store.edit { it[DYNAMIC_COLOR] = enabled }
+
+    suspend fun setLastFmCredentials(apiKey: String, apiSecret: String) =
+        store.edit {
+            it[LASTFM_API_KEY]    = apiKey
+            it[LASTFM_API_SECRET] = apiSecret
+        }
+
+    suspend fun setLastFmSession(sessionKey: String, username: String) =
+        store.edit {
+            it[LASTFM_SESSION_KEY] = sessionKey
+            it[LASTFM_USERNAME]    = username
+        }
+
+    suspend fun setScrobblingEnabled(enabled: Boolean) =
+        store.edit { it[SCROBBLING_ENABLED] = enabled }
+
+    suspend fun toggleFavorite(songId: String): Boolean {
+        var isNowFavorite = false
+        store.edit { prefs ->
+            val raw = prefs[FAVORITE_IDS] ?: "[]"
+            val ids = runCatching {
+                Json.decodeFromString<List<String>>(raw).toMutableSet()
+            }.getOrDefault(mutableSetOf())
+            if (ids.contains(songId)) {
+                ids.remove(songId)
+                isNowFavorite = false
+            } else {
+                ids.add(songId)
+                isNowFavorite = true
+            }
+            prefs[FAVORITE_IDS] = Json.encodeToString(ids.toList())
+        }
+        return isNowFavorite
+    }
+
+    suspend fun isFavorite(songId: String): Boolean {
+        val prefs = store.data.catch { emit(emptyPreferences()) }
+            .map { it }
+            .let { flow ->
+                var result = false
+                flow.collect { p ->
+                    val raw = p[FAVORITE_IDS] ?: "[]"
+                    result = runCatching {
+                        Json.decodeFromString<List<String>>(raw).contains(songId)
+                    }.getOrDefault(false)
+                }
+                result
+            }
+        return prefs
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    private fun Flow<Preferences>.catchAndDefault() =
+        catch { emit(emptyPreferences()) }
+}

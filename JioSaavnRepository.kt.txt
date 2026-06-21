@@ -1,0 +1,376 @@
+package com.foss.madhu.data
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.util.Base64
+import android.util.Log
+import com.foss.madhu.data.model.Lyrics
+import com.foss.madhu.data.model.LyricsLine
+import com.foss.madhu.data.model.Song
+import com.foss.madhu.data.model.StreamQuality
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.net.URLEncoder
+import java.nio.charset.Charset
+import javax.crypto.Cipher
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * JioSaavnRepository
+ *
+ * Wraps the JioSaavn public JSON API. Responsibilities:
+ * - Full-text song search with pagination
+ * - Song metadata hydration (details by ID)
+ * - DES-decryption of the encrypted CDN media URLs returned by the API
+ * - Dynamic 3-tier quality mapping (96 / 160 / 320 kbps AAC)
+ * - Auto-playlist generation using genre + language heuristics
+ * - LRC / plain-text lyrics fetching and parsing
+ * - Similar-song recommendations for contextual queue building
+ */
+class JioSaavnRepository(
+    private val context: Context,
+    private val okHttpClient: OkHttpClient
+) {
+
+    companion object {
+        private const val TAG = "JioSaavnRepo"
+        private const val BASE = "https://www.jiosaavn.com/api.php"
+
+        // Fixed DES-ECB key used by JioSaavn to obfuscate CDN URLs.
+        private const val DES_KEY = "38346591"
+
+        // Quality suffix patterns inside decrypted CDN URLs.
+        private val QUALITY_SUFFIXES = listOf(
+            "_96.mp4", "_160.mp4", "_320.mp4",
+            "_96.mp3", "_160.mp3", "_320.mp3"
+        )
+
+        // Global query parameters common to every API call.
+        private const val COMMON_PARAMS =
+            "_format=json&_marker=0&api_version=4&ctx=web6dot0"
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PUBLIC API
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Full-text song search. Returns up to [pageSize] results for [page].
+     */
+    suspend fun search(query: String, page: Int = 1, pageSize: Int = 20): List<Song> =
+        withContext(Dispatchers.IO) {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "$BASE?__call=search.getResults&$COMMON_PARAMS&n=$pageSize&p=$page&q=$encoded"
+            val json = fetchJson(url) ?: return@withContext emptyList()
+            val results = json["results"]?.jsonArray ?: return@withContext emptyList()
+            results.mapNotNull { parseSongElement(it.jsonObject) }
+        }
+
+    /**
+     * Hydrates full song details (including encrypted media URL) for the given ID.
+     */
+    suspend fun getSongById(songId: String): Song? = withContext(Dispatchers.IO) {
+        val url = "$BASE?__call=song.getDetails&$COMMON_PARAMS&pids=$songId"
+        val json = fetchJson(url) ?: return@withContext null
+        // Song details endpoint returns a map keyed by song ID.
+        val songObj = json[songId]?.jsonObject ?: json.values.firstOrNull()?.jsonObject
+        songObj?.let { parseSongElement(it) }
+    }
+
+    /**
+     * Resolves the streamable HTTPS CDN URL for [song] at the requested [quality].
+     *
+     * For AUTO quality, measures the current network downlink speed and selects:
+     *   >= 1.0 Mbps  → 320 kbps
+     *   >= 0.5 Mbps  → 160 kbps
+     *   < 0.5 Mbps   → 96 kbps
+     */
+    suspend fun getStreamUrl(song: Song, quality: StreamQuality): String =
+        withContext(Dispatchers.IO) {
+            val decrypted = decryptStreamUrl(song.encryptedMediaUrl)
+            if (decrypted.isEmpty()) {
+                Log.e(TAG, "Failed to decrypt stream URL for ${song.id}")
+                return@withContext ""
+            }
+
+            val resolvedSuffix = when (quality) {
+                StreamQuality.DATA_SAVER  -> "_96.mp4"
+                StreamQuality.HI_FIDELITY -> if (song.is320kbps) "_320.mp4" else "_160.mp4"
+                StreamQuality.AUTO        -> {
+                    val mbps = estimateNetworkMbps()
+                    when {
+                        mbps >= 1.0f -> if (song.is320kbps) "_320.mp4" else "_160.mp4"
+                        mbps >= 0.4f -> "_160.mp4"
+                        else         -> "_96.mp4"
+                    }
+                }
+            }
+
+            replaceQualitySuffix(decrypted, resolvedSuffix)
+                .replace("http://", "https://")
+        }
+
+    /**
+     * Fetches LRC-formatted or plain-text lyrics for [lyricsId].
+     * Returns null if the song has no lyrics or the fetch fails.
+     */
+    suspend fun getLyrics(lyricsId: String): Lyrics? = withContext(Dispatchers.IO) {
+        if (lyricsId.isBlank()) return@withContext null
+        val url = "$BASE?__call=lyrics.getLyrics&$COMMON_PARAMS&lyrics_id=$lyricsId"
+        val json = fetchJson(url) ?: return@withContext null
+        val rawLyrics = json["lyrics"]?.jsonPrimitive?.contentOrNull ?: return@withContext null
+        parseLyrics(lyricsId, rawLyrics.unescapeHtml())
+    }
+
+    /**
+     * Returns up to 20 songs similar to [song] for contextual queue building.
+     *
+     * Heuristic priority:
+     *  1. JioSaavn's native recommendation endpoint (best signal)
+     *  2. Artist search fallback
+     *  3. Genre + language search fallback
+     */
+    suspend fun getSimilarSongs(song: Song): List<Song> = withContext(Dispatchers.IO) {
+        // Tier 1: Native recommendations
+        val recoUrl = "$BASE?__call=reco.getreco&$COMMON_PARAMS&pid=${song.id}&language=${song.language}"
+        val recoJson = fetchJson(recoUrl)
+        val recoSongs = recoJson?.jsonArray?.mapNotNull { parseSongElement(it.jsonObject) }
+            ?: emptyList()
+        if (recoSongs.size >= 10) return@withContext recoSongs.take(20).filter { it.id != song.id }
+
+        // Tier 2: Artist search
+        val artistSongs = search("${song.artist}", pageSize = 10)
+            .filter { it.id != song.id }
+
+        // Tier 3: Genre + language
+        val contextQuery = buildString {
+            if (song.genre.isNotBlank())    append("${song.genre} ")
+            if (song.language.isNotBlank()) append(song.language)
+        }.trim()
+        val contextSongs = if (contextQuery.isNotEmpty()) {
+            search(contextQuery, pageSize = 10).filter { it.id != song.id }
+        } else emptyList()
+
+        (recoSongs + artistSongs + contextSongs)
+            .distinctBy { it.id }
+            .filter { it.id != song.id }
+            .shuffled()
+            .take(20)
+    }
+
+    /**
+     * Returns songs for an album by [albumId], useful for gapless album playback.
+     */
+    suspend fun getAlbumSongs(albumId: String): List<Song> = withContext(Dispatchers.IO) {
+        val url = "$BASE?__call=content.getAlbumDetails&$COMMON_PARAMS&albumid=$albumId"
+        val json = fetchJson(url) ?: return@withContext emptyList()
+        json["songs"]?.jsonArray?.mapNotNull { parseSongElement(it.jsonObject) } ?: emptyList()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — JSON parsing
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun parseSongElement(obj: JsonObject): Song? {
+        return try {
+            val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: return null
+            val title = obj["title"]?.jsonPrimitive?.contentOrNull
+                ?.unescapeHtml() ?: return null
+            val moreInfo = obj["more_info"]?.jsonObject ?: JsonObject(emptyMap())
+
+            // Artist: subtitle field or primary_artists from artistMap
+            val artist = obj["subtitle"]?.jsonPrimitive?.contentOrNull?.unescapeHtml()
+                ?: moreInfo["music"]?.jsonPrimitive?.contentOrNull?.unescapeHtml()
+                ?: moreInfo["artistMap"]?.jsonObject
+                    ?.get("primary_artists")?.jsonArray
+                    ?.firstOrNull()?.jsonObject
+                    ?.get("name")?.jsonPrimitive?.contentOrNull
+                ?: "Unknown Artist"
+
+            val album = moreInfo["album"]?.jsonPrimitive?.contentOrNull?.unescapeHtml()
+                ?: obj["header_desc"]?.jsonPrimitive?.contentOrNull?.unescapeHtml()
+                ?: ""
+            val albumId = moreInfo["album_id"]?.jsonPrimitive?.contentOrNull
+                ?: moreInfo["albumid"]?.jsonPrimitive?.contentOrNull
+                ?: ""
+
+            // Image: prefer the highest-res variant JioSaavn provides directly
+            val image = obj["image"]?.jsonPrimitive?.contentOrNull
+                ?.replace("150x150", "500x500")
+                ?.replace("50x50",   "500x500")
+                ?.replace("http://", "https://")
+                ?: ""
+
+            val durationStr = moreInfo["duration"]?.jsonPrimitive?.contentOrNull ?: "0"
+            val duration = durationStr.toIntOrNull() ?: 0
+
+            val encUrl = moreInfo["encrypted_media_url"]?.jsonPrimitive?.contentOrNull ?: ""
+            val genre  = moreInfo["genre"]?.jsonPrimitive?.contentOrNull
+                ?: obj["type"]?.jsonPrimitive?.contentOrNull ?: ""
+            val lang   = obj["language"]?.jsonPrimitive?.contentOrNull ?: ""
+
+            val has320 = moreInfo["320kbps"]?.jsonPrimitive?.contentOrNull == "true"
+            val hasLyr = moreInfo["has_lyrics"]?.jsonPrimitive?.contentOrNull == "true"
+            val lyrId  = moreInfo["lyrics_id"]?.jsonPrimitive?.contentOrNull ?: ""
+            val year   = obj["year"]?.jsonPrimitive?.contentOrNull ?: ""
+
+            Song(
+                id                 = id,
+                title              = title,
+                artist             = artist,
+                album              = album,
+                albumId            = albumId,
+                albumArtUrl        = image,
+                durationSeconds    = duration,
+                encryptedMediaUrl  = encUrl,
+                genre              = genre,
+                language           = lang,
+                hasLyrics          = hasLyr,
+                lyricsId           = lyrId,
+                is320kbps          = has320,
+                year               = year
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Skipping malformed song element: ${e.message}")
+            null
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Lyrics parsing
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun parseLyrics(songId: String, raw: String): Lyrics {
+        // Detect LRC format: lines start with [mm:ss.xx]
+        val lrcPattern = Regex("""^\[(\d{1,2}):(\d{2})\.(\d{2,3})\](.*)$""", RegexOption.MULTILINE)
+        val lrcMatches = lrcPattern.findAll(raw).toList()
+
+        return if (lrcMatches.isNotEmpty()) {
+            val lines = lrcMatches.mapNotNull { match ->
+                val minutes      = match.groupValues[1].toLongOrNull() ?: return@mapNotNull null
+                val seconds      = match.groupValues[2].toLongOrNull() ?: return@mapNotNull null
+                val subsRaw      = match.groupValues[3].padEnd(3, '0').take(3)
+                val milliseconds = subsRaw.toLongOrNull() ?: 0L
+                val text         = match.groupValues[4].trim().unescapeHtml()
+                val tsMs         = (minutes * 60 + seconds) * 1000L + milliseconds
+                if (text.isEmpty()) null else LyricsLine(tsMs, text)
+            }
+            Lyrics(songId, lines, isTimeSynced = true)
+        } else {
+            // Plain text with HTML <br> separators
+            val lines = raw
+                .replace("<br>", "\n", ignoreCase = true)
+                .split("\n")
+                .map { it.trim().unescapeHtml() }
+                .filter { it.isNotEmpty() }
+                .mapIndexed { index, text ->
+                    // Assign a synthetic timestamp of 3 s per line for scrolling UI.
+                    LyricsLine(index * 3_000L, text)
+                }
+            Lyrics(songId, lines, isTimeSynced = false)
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — DES decryption
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Decrypts the DES/ECB/PKCS5 encoded media URL returned by the JioSaavn API.
+     *
+     * Algorithm:
+     *  1. Trim whitespace from the Base64 input.
+     *  2. Decode Base64 → ciphertext bytes.
+     *  3. Decrypt with fixed key "38346591" using DES/ECB/PKCS5Padding.
+     *  4. Decode resulting bytes as UTF-8.
+     */
+    private fun decryptStreamUrl(encryptedUrl: String): String {
+        return try {
+            val key    = SecretKeySpec(DES_KEY.toByteArray(Charsets.UTF_8), "DES")
+            val cipher = Cipher.getInstance("DES/ECB/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, key)
+            val cipherBytes = Base64.decode(encryptedUrl.trim(), Base64.DEFAULT)
+            String(cipher.doFinal(cipherBytes), Charset.forName("UTF-8"))
+        } catch (e: Exception) {
+            Log.e(TAG, "DES decryption failed: ${e.message}")
+            ""
+        }
+    }
+
+    /**
+     * Replaces whichever quality suffix is present in [url] with [targetSuffix].
+     * Handles both .mp4 (AAC) and .mp3 variants from the CDN.
+     */
+    private fun replaceQualitySuffix(url: String, targetSuffix: String): String {
+        for (suffix in QUALITY_SUFFIXES) {
+            if (url.contains(suffix)) {
+                val mappedTarget = if (suffix.endsWith(".mp3")) {
+                    targetSuffix.replace(".mp4", ".mp3")
+                } else {
+                    targetSuffix
+                }
+                return url.replace(suffix, mappedTarget)
+            }
+        }
+        // URL has no recognised suffix — append target before query params
+        return url
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Network helpers
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun fetchJson(url: String): JsonObject? {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
+                .addHeader("Accept", "application/json, text/plain, */*")
+                .addHeader("Referer", "https://www.jiosaavn.com/")
+                .build()
+            val response = okHttpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.w(TAG, "HTTP ${response.code} for $url")
+                return null
+            }
+            val body = response.body?.string() ?: return null
+            Json.parseToJsonElement(body).jsonObject
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchJson failed: $url — ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Estimates current downlink speed in Mbps using the active network transport
+     * capability report. Falls back to 1.0 Mbps (HiFi threshold) if unavailable.
+     */
+    private fun estimateNetworkMbps(): Float {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return 1.0f
+            val downlinkKbps = caps.linkDownstreamBandwidthKbps
+            downlinkKbps / 1_000f
+        } catch (e: Exception) {
+            1.0f
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Extension helpers
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun String.unescapeHtml(): String = this
+        .replace("&amp;",  "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&lt;",   "<")
+        .replace("&gt;",   ">")
+        .replace("&nbsp;", " ")
+        .trim()
+}

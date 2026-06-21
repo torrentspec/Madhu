@@ -1,0 +1,282 @@
+package com.foss.madhu.audio
+
+import android.media.audiofx.Equalizer
+import android.util.Log
+import com.foss.madhu.data.model.EqPreset
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * AudioEffectManager
+ *
+ * Hooks into Android's native hardware [android.media.audiofx.Equalizer] and provides
+ * five hand-crafted frequency profiles over a custom 5-band map at:
+ *
+ *   Band 0 →  60 Hz   (sub-bass / room rumble)
+ *   Band 1 → 230 Hz   (bass / kick body)
+ *   Band 2 → 910 Hz   (low-mid / instrument body)
+ *   Band 3 →   4 kHz  (high-mid / presence / consonants)
+ *   Band 4 →  14 kHz  (air / extreme highs / shimmer)
+ *
+ * Gain values are in millibels (mB): 100 mB = +1 dB, −1500 mB = −15 dB.
+ * Device hardware range is queried at attach time and values are clamped accordingly.
+ *
+ * Call [attach] when ExoPlayer's audioSessionId is known (after first prepare).
+ * Call [release] in onDestroy / when the player is released.
+ */
+class AudioEffectManager {
+
+    companion object {
+        private const val TAG = "AudioEffectManager"
+        private const val BAND_COUNT = 5
+
+        /** Target Hz for each of our 5 logical bands. */
+        private val TARGET_HZ = intArrayOf(60, 230, 910, 4_000, 14_000)
+
+        // ── Preset definitions (mB per logical band 0..4) ─────────────────────
+
+        /**
+         * Studio Clean — Ruler-flat clinical reference curve.
+         * Designed for accurate monitoring: zero coloration, zero emphasis.
+         * Every frequency reproduced with equal fidelity.
+         */
+        private val PRESET_STUDIO_CLEAN = shortArrayOf(0, 0, 0, 0, 0)
+
+        /**
+         * Warm Tube — Analogue warmth signature without excess mud.
+         *  +1.5 dB  @ 60 Hz:   gentle sub-bass foundation
+         *  +3.5 dB  @ 230 Hz:  rich bass body / low-harmonic hump (the "warmth")
+         *  +2.0 dB  @ 910 Hz:  slight low-mid presence for instrument thickness
+         *  −1.0 dB  @ 4 kHz:   slightly rolled-off harsh transients
+         *  −4.0 dB  @ 14 kHz:  de-emphasized high-end; removes digital harshness
+         */
+        private val PRESET_WARM_TUBE = shortArrayOf(150, 350, 200, -100, -400)
+
+        /**
+         * Sub-Bass Rumble — Visceral sub-bass shelf without vocal bleed.
+         *  +9.0 dB  @ 60 Hz:   extreme sub-sonic emphasis; felt as much as heard
+         *  +4.0 dB  @ 230 Hz:  mid-bass to extend the rumble into audible range
+         *  −1.5 dB  @ 910 Hz:  slight notch to separate sub from vocal chest resonance
+         *  −2.0 dB  @ 4 kHz:   tame upper-mid harshness from boost headroom overhead
+         *  −2.5 dB  @ 14 kHz:  reduce treble sibilance that conflicts with sub energy
+         */
+        private val PRESET_SUB_BASS_RUMBLE = shortArrayOf(900, 400, -150, -200, -250)
+
+        /**
+         * Vocal Intimacy — Front-row acoustic presence; every syllable in focus.
+         *  −2.0 dB  @ 60 Hz:   reduce competing sub-bass muddiness
+         *   0.0 dB  @ 230 Hz:  neutral bass; let vocals breathe
+         *  +3.5 dB  @ 910 Hz:  low-mid chest resonance; fullness in voices
+         *  +6.5 dB  @ 4 kHz:   critical presence peak; consonants, attack, intimacy
+         *  +2.0 dB  @ 14 kHz:  light air lift for breath and room detail
+         */
+        private val PRESET_VOCAL_INTIMACY = shortArrayOf(-200, 0, 350, 650, 200)
+
+        /**
+         * V-Shaped Sparkle — Aggressive club / DJ monitor profile.
+         *  +7.5 dB  @ 60 Hz:   punchy sub; kick-drum impact in your chest
+         *  +3.5 dB  @ 230 Hz:  kick-bass body extension
+         *  −4.0 dB  @ 910 Hz:  scooped mids; the defining "V" recession
+         *  +2.5 dB  @ 4 kHz:   high-mid snap for cymbal attack clarity
+         *  +9.0 dB  @ 14 kHz:  crystalline extreme-high sparkle; dance-floor air
+         */
+        private val PRESET_V_SHAPED_SPARKLE = shortArrayOf(750, 350, -400, 250, 900)
+    }
+
+    // ── State ─────────────────────────────────────────────────────────────────
+
+    private var equalizer: Equalizer? = null
+    private var deviceBandCount: Int = 0
+
+    /**
+     * Maps our 5 logical band indices to the nearest available hardware band.
+     * Populated in [buildBandMapping] after the device EQ is opened.
+     */
+    private val bandMapping = IntArray(BAND_COUNT) { -1 }
+
+    private val _activePreset  = MutableStateFlow(EqPreset.OFF)
+    val activePreset: StateFlow<EqPreset> = _activePreset.asStateFlow()
+
+    private val _customBands   = MutableStateFlow(ShortArray(BAND_COUNT) { 0 })
+    val customBands: StateFlow<ShortArray> = _customBands.asStateFlow()
+
+    private val _isEnabled     = MutableStateFlow(false)
+    val isEnabled: StateFlow<Boolean> = _isEnabled.asStateFlow()
+
+    /** Minimum and maximum gain in mB supported by this device's hardware EQ. */
+    private var minLevelMb: Short = -1500
+    private var maxLevelMb: Short =  1500
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    /**
+     * Attach the hardware EQ to [audioSessionId].
+     * Must be called after ExoPlayer has prepared its first media item so that
+     * the session ID is valid. Safe to call multiple times — releases previous.
+     */
+    fun attach(audioSessionId: Int) {
+        release()
+        if (audioSessionId == 0) {
+            Log.w(TAG, "Audio session ID is 0 — EQ not attached")
+            return
+        }
+        try {
+            val eq = Equalizer(0, audioSessionId)
+            equalizer = eq
+            deviceBandCount = eq.numberOfBands.toInt()
+            val range  = eq.bandLevelRange
+            minLevelMb = range[0]
+            maxLevelMb = range[1]
+            buildBandMapping(eq)
+            Log.d(TAG, "EQ attached. Device bands=$deviceBandCount, " +
+                    "range=[$minLevelMb, $maxLevelMb] mB, mapping=${bandMapping.toList()}")
+
+            // Re-apply the previously selected preset if EQ was already in use.
+            if (_activePreset.value != EqPreset.OFF) {
+                applyPreset(_activePreset.value)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to attach Equalizer to session $audioSessionId: ${e.message}")
+            equalizer = null
+        }
+    }
+
+    fun release() {
+        try {
+            equalizer?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception during Equalizer release: ${e.message}")
+        } finally {
+            equalizer = null
+            _isEnabled.value = false
+        }
+    }
+
+    // ── Preset control ────────────────────────────────────────────────────────
+
+    /**
+     * Applies [preset] to the hardware EQ. If [EqPreset.OFF], disables the effect
+     * entirely (bypasses the equalizer in the DSP chain).
+     */
+    fun applyPreset(preset: EqPreset) {
+        _activePreset.value = preset
+
+        val eq = equalizer
+        if (eq == null) {
+            // Store intent for when the EQ is later attached.
+            Log.d(TAG, "EQ not yet attached — preset $preset queued")
+            return
+        }
+
+        if (preset == EqPreset.OFF) {
+            eq.enabled   = false
+            _isEnabled.value = false
+            return
+        }
+
+        val gains: ShortArray = presetGains(preset)
+        applyGains(eq, gains)
+    }
+
+    /** Returns the [ShortArray] of 5 mB gain values for [preset]. */
+    fun presetGains(preset: EqPreset): ShortArray = when (preset) {
+        EqPreset.STUDIO_CLEAN      -> PRESET_STUDIO_CLEAN.clone()
+        EqPreset.WARM_TUBE         -> PRESET_WARM_TUBE.clone()
+        EqPreset.SUB_BASS_RUMBLE   -> PRESET_SUB_BASS_RUMBLE.clone()
+        EqPreset.VOCAL_INTIMACY    -> PRESET_VOCAL_INTIMACY.clone()
+        EqPreset.V_SHAPED_SPARKLE  -> PRESET_V_SHAPED_SPARKLE.clone()
+        EqPreset.CUSTOM            -> _customBands.value.clone()
+        EqPreset.OFF               -> ShortArray(BAND_COUNT) { 0 }
+    }
+
+    // ── Custom band control ───────────────────────────────────────────────────
+
+    /**
+     * Updates a single logical band for the CUSTOM preset.
+     *
+     * @param logicalBand  Index 0–4 into our 5 logical bands (60 Hz … 14 kHz).
+     * @param gainMb       Desired gain in millibels; will be clamped to device range.
+     */
+    fun setCustomBandGain(logicalBand: Int, gainMb: Short) {
+        if (logicalBand !in 0 until BAND_COUNT) return
+        val updated = _customBands.value.clone()
+        updated[logicalBand] = gainMb
+        _customBands.value = updated
+
+        if (_activePreset.value == EqPreset.CUSTOM) {
+            val eq          = equalizer ?: return
+            val deviceBand  = bandMapping[logicalBand]
+            if (deviceBand < 0) return
+            try {
+                val clamped = gainMb.coerceIn(minLevelMb, maxLevelMb)
+                eq.setBandLevel(deviceBand.toShort(), clamped)
+            } catch (e: Exception) {
+                Log.e(TAG, "setBandLevel error: ${e.message}")
+            }
+        }
+    }
+
+    // ── Query helpers ─────────────────────────────────────────────────────────
+
+    /** Human-readable label for each logical band, suitable for slider labels. */
+    fun bandLabels(): List<String> = listOf("60 Hz", "230 Hz", "910 Hz", "4 kHz", "14 kHz")
+
+    /** Current gain for logical [band] in millibels (from hardware or last set value). */
+    fun getBandLevelMb(band: Int): Short {
+        val eq = equalizer ?: return _customBands.value.getOrElse(band) { 0 }
+        val deviceBand = bandMapping.getOrElse(band) { -1 }
+        return try {
+            if (deviceBand >= 0) eq.getBandLevel(deviceBand.toShort()) else 0
+        } catch (e: Exception) { 0 }
+    }
+
+    /** Device-specific EQ gain range [min, max] in mB, safe to use for Slider bounds. */
+    fun gainRange(): Pair<Short, Short> = Pair(minLevelMb, maxLevelMb)
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Iterates device frequency bands and maps the closest one to each of our 5
+     * logical target frequencies. Uses Hz (Android returns mHz / 1000 = Hz).
+     */
+    private fun buildBandMapping(eq: Equalizer) {
+        val deviceFreqsHz = (0 until deviceBandCount).map { b ->
+            eq.getCenterFreq(b.toShort()) / 1_000  // milliHz → Hz
+        }
+        for (logicalBand in 0 until BAND_COUNT) {
+            val target   = TARGET_HZ[logicalBand]
+            var bestBand = 0
+            var minDiff  = Int.MAX_VALUE
+            deviceFreqsHz.forEachIndexed { deviceBand, hz ->
+                val diff = Math.abs(hz - target)
+                if (diff < minDiff) { minDiff = diff; bestBand = deviceBand }
+            }
+            bandMapping[logicalBand] = bestBand
+            Log.v(TAG, "Logical band $logicalBand (${TARGET_HZ[logicalBand]} Hz)" +
+                    " → device band $bestBand (${deviceFreqsHz[bestBand]} Hz)")
+        }
+    }
+
+    private fun applyGains(eq: Equalizer, gains: ShortArray) {
+        try {
+            for (logicalBand in 0 until BAND_COUNT) {
+                val deviceBand = bandMapping[logicalBand]
+                if (deviceBand < 0 || logicalBand >= gains.size) continue
+                val clamped = gains[logicalBand].coerceIn(minLevelMb, maxLevelMb)
+                eq.setBandLevel(deviceBand.toShort(), clamped)
+            }
+            eq.enabled   = true
+            _isEnabled.value = true
+        } catch (e: Exception) {
+            Log.e(TAG, "applyGains failed: ${e.message}")
+        }
+    }
+
+    private fun Short.coerceIn(min: Short, max: Short): Short =
+        when {
+            this < min -> min
+            this > max -> max
+            else       -> this
+        }
+}

@@ -1,0 +1,159 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace  = "com.foss.madhu"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId   = "com.foss.madhu"
+        minSdk          = 26
+        targetSdk       = 35
+        versionCode     = 1
+        versionName     = "1.0.0"
+        vectorDrawables.useSupportLibrary = true
+        // WorkManager requires this so the scheduler can locate our worker class.
+        multiDexEnabled = false
+    }
+
+    signingConfigs {
+        // Release signing is injected via environment variables in CI.
+        // The GitHub Actions keystore workflow in Termux writes these.
+        create("release") {
+            storeFile   = System.getenv("KEYSTORE_PATH")?.let { file(it) }
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias      = System.getenv("KEY_ALIAS")
+            keyPassword   = System.getenv("KEY_PASSWORD")
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled   = true
+            isShrinkResources = true
+            signingConfig     = signingConfigs.getByName("release")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            // Strip debug symbols and native symbol tables from the APK.
+            ndk { debugSymbolLevel = "NONE" }
+        }
+        getByName("debug") {
+            isMinifyEnabled   = false
+            isShrinkResources = false
+            applicationIdSuffix = ".debug"
+            isDebuggable        = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+        freeCompilerArgs += listOf(
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+            "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi",
+            "-opt-in=androidx.compose.animation.ExperimentalAnimationApi",
+            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
+            "-opt-in=androidx.media3.common.util.UnstableApi"
+        )
+    }
+
+    buildFeatures {
+        compose     = true
+        buildConfig = true
+    }
+
+    // Aggressive resource shrinking: strip unused locales, densities, ABIs.
+    packaging {
+        resources.excludes += setOf(
+            "META-INF/DEPENDENCIES",
+            "META-INF/LICENSE*",
+            "META-INF/NOTICE*",
+            "META-INF/*.kotlin_module",
+            "kotlin/**",
+            "okhttp3/**",
+            "/*.txt",
+            "/*.properties"
+        )
+        jniLibs.useLegacyPackaging = false
+    }
+
+    // Split APKs / AABs by ABI and density to minimise download size per device.
+    bundle {
+        language.enableSplit = true
+        density.enableSplit  = true
+        abi.enableSplit      = true
+    }
+
+    // Lint: fail on resource shrinking unused warnings so CI catches bloat early.
+    lint {
+        abortOnError       = false
+        checkReleaseBuilds = true
+        disable           += setOf("MissingTranslation")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VERSION CATALOG (inline) — keeps build.gradle self-contained for Termux CI.
+// ──────────────────────────────────────────────────────────────────────────────
+val media3Version    = "1.4.1"
+val coilVersion      = "2.7.0"
+val okhttpVersion    = "4.12.0"
+val serializationVer = "1.7.3"
+val coroutinesVer    = "1.9.0"
+val workVersion      = "2.10.0"
+val composeBomVer    = "2024.12.01"
+
+dependencies {
+    // ── Core Android ──────────────────────────────────────────────────────────
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+    implementation("androidx.navigation:navigation-compose:2.8.4")
+
+    // ── Jetpack Compose (BOM pins all Compose versions) ───────────────────────
+    val composeBom = platform("androidx.compose:compose-bom:$composeBomVer")
+    implementation(composeBom)
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.compose.animation:animation")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // ── Media3 / ExoPlayer (3 artifacts; no ffmpeg extension = smaller APK) ──
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-session:$media3Version")
+    implementation("androidx.media3:media3-datasource-okhttp:$media3Version")
+
+    // ── Network: OkHttp only (no Retrofit; saves ~200 KB over Retrofit + GSON) ─
+    implementation("com.squareup.okhttp3:okhttp:$okhttpVersion")
+
+    // ── Serialization: Kotlin-native JSON (no GSON / Moshi runtime needed) ───
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVer")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVer")
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+
+    // ── Background work ───────────────────────────────────────────────────────
+    implementation("androidx.work:work-runtime-ktx:$workVersion")
+
+    // ── Palette (album art color extraction) ─────────────────────────────────
+    implementation("androidx.palette:palette-ktx:1.0.0")
+
+    // ── Image loading: Coil (≈ 900 KB vs Glide ≈ 2.5 MB) ───────────────────
+    implementation("io.coil-kt:coil-compose:$coilVersion")
+}

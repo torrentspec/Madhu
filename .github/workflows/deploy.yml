@@ -1,0 +1,57 @@
+name: Compile & Package Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Compile & Package Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradle Wrapper
+        run: chmod +x gradlew
+
+      - name: Decode and Reconstruct Keystore File
+        run: |
+          echo "${{ secrets.SIGNING_KEY_BASE64 }}" | base64 --decode > app/madhu-release.jks
+
+      - name: Build and Optimize Release APK via Gradle
+        run: ./gradlew assembleRelease
+        env:
+          RELEASE_STORE_FILE: "madhu-release.jks"
+          RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      - name: Sign Production APK
+        uses: r0adkll/sign-android-release@v1
+        id: sign_app
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY_BASE64 }}
+          alias: ${{ secrets.RELEASE_KEY_ALIAS }}
+          singlePopulatedKey: true
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      - name: Upload Signed Production Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madhu-Release-Signed-APK
+          path: ${{ steps.sign_app.outputs.signedReleaseFile }}
+          if-no-files-found: error
+          retention-days: 7
