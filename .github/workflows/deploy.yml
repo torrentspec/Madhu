@@ -27,6 +27,7 @@ jobs:
 
       - name: Decode and Reconstruct Keystore File
         run: |
+          mkdir -p app
           echo "${{ secrets.SIGNING_KEY_BASE64 }}" | base64 --decode > app/madhu-release.jks
 
       - name: Build and Optimize Release APK via Gradle
