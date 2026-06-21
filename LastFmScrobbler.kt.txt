@@ -1,0 +1,212 @@
+package com.foss.madhu.scrobble
+
+import android.util.Log
+import com.foss.madhu.data.model.Song
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+
+/**
+ * LastFmScrobbler
+ *
+ * Implements the Last.fm Scrobbling API v2.0 (https://www.last.fm/api).
+ *
+ * Auth flow:
+ *  1. App developer registers at last.fm/api → receives api_key + shared_secret.
+ *  2. [authenticate] calls auth.getMobileSession with the user's credentials
+ *     and stores the session key (persisted in [UserPreferences]).
+ *  3. All subsequent calls sign their parameter map with [sign] (MD5 HMAC of
+ *     sorted key=value pairs + shared_secret), then POST to the API.
+ *
+ * Scrobbling rules (Last.fm spec):
+ *  • Call [updateNowPlaying] when a new track begins.
+ *  • Call [scrobble] when the track has been played for ≥ 30 s AND ≥ 50 % of
+ *    its total duration (caller in [ExoPlaybackEngine] enforces the 50 % gate).
+ */
+class LastFmScrobbler(
+    private val okHttpClient: OkHttpClient
+) {
+    companion object {
+        private const val TAG      = "LastFmScrobbler"
+        private const val BASE_URL = "https://ws.audioscrobbler.com/2.0/"
+    }
+
+    // Credentials injected after the user saves them in Settings.
+    var apiKey:     String = ""
+    var apiSecret:  String = ""
+    var sessionKey: String = ""
+    var enabled:    Boolean = false
+
+    // ── Auth ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Authenticates with Last.fm using mobile session auth.
+     * [password] is the user's plain-text password — the API requires the
+     * MD5 hash of it for the getMobileSession call.
+     *
+     * Returns the session key on success, null on failure.
+     */
+    suspend fun authenticate(username: String, password: String): String? =
+        withContext(Dispatchers.IO) {
+            if (apiKey.isBlank() || apiSecret.isBlank()) {
+                Log.w(TAG, "API key / secret not configured")
+                return@withContext null
+            }
+            val passwordMd5 = md5(password)
+            val params = mutableMapOf(
+                "method"   to "auth.getMobileSession",
+                "username" to username,
+                "password" to passwordMd5,
+                "api_key"  to apiKey
+            )
+            params["api_sig"] = sign(params)
+            params["format"]  = "json"
+
+            return@withContext try {
+                val body = postForm(params)
+                // Parse {"session":{"name":"…","key":"…","subscriber":"…"}}
+                val keyMatch = Regex(""""key"\s*:\s*"([^"]+)"""").find(body)
+                val key      = keyMatch?.groupValues?.get(1)
+                if (key != null) {
+                    sessionKey = key
+                    Log.d(TAG, "Auth successful for $username")
+                }
+                key
+            } catch (e: Exception) {
+                Log.e(TAG, "Authentication failed: ${e.message}")
+                null
+            }
+        }
+
+    // ── Now Playing ───────────────────────────────────────────────────────────
+
+    /**
+     * Notifies Last.fm that [song] is currently playing.
+     * Silently no-ops if scrobbling is disabled or credentials are missing.
+     */
+    suspend fun updateNowPlaying(song: Song) = withContext(Dispatchers.IO) {
+        if (!isReady()) return@withContext
+        val params = mutableMapOf(
+            "method"  to "track.updateNowPlaying",
+            "track"   to song.title,
+            "artist"  to song.artist,
+            "album"   to song.album,
+            "duration" to song.durationSeconds.toString(),
+            "api_key" to apiKey,
+            "sk"      to sessionKey
+        )
+        params["api_sig"] = sign(params)
+        params["format"]  = "json"
+
+        runCatching { postForm(params) }
+            .onFailure { Log.w(TAG, "updateNowPlaying failed: ${it.message}") }
+            .onSuccess { Log.v(TAG, "Now playing updated: ${song.title}") }
+    }
+
+    // ── Scrobble ──────────────────────────────────────────────────────────────
+
+    /**
+     * Submits a completed scrobble for [song].
+     * [timestampSeconds] defaults to the current Unix timestamp.
+     */
+    suspend fun scrobble(
+        song: Song,
+        timestampSeconds: Long = System.currentTimeMillis() / 1_000L
+    ) = withContext(Dispatchers.IO) {
+        if (!isReady()) return@withContext
+        val params = mutableMapOf(
+            "method"    to "track.scrobble",
+            "track"     to song.title,
+            "artist"    to song.artist,
+            "album"     to song.album,
+            "timestamp" to timestampSeconds.toString(),
+            "duration"  to song.durationSeconds.toString(),
+            "api_key"   to apiKey,
+            "sk"        to sessionKey
+        )
+        params["api_sig"] = sign(params)
+        params["format"]  = "json"
+
+        runCatching { postForm(params) }
+            .onFailure { Log.w(TAG, "scrobble failed for ${song.title}: ${it.message}") }
+            .onSuccess { Log.d(TAG, "Scrobbled: ${song.artist} — ${song.title}") }
+    }
+
+    // ── Love / Unlove ─────────────────────────────────────────────────────────
+
+    suspend fun love(song: Song)   = sendLoveAction(song, "track.love")
+    suspend fun unlove(song: Song) = sendLoveAction(song, "track.unlove")
+
+    private suspend fun sendLoveAction(song: Song, method: String) =
+        withContext(Dispatchers.IO) {
+            if (!isReady()) return@withContext
+            val params = mutableMapOf(
+                "method"  to method,
+                "track"   to song.title,
+                "artist"  to song.artist,
+                "api_key" to apiKey,
+                "sk"      to sessionKey
+            )
+            params["api_sig"] = sign(params)
+            params["format"]  = "json"
+            runCatching { postForm(params) }
+                .onFailure { Log.w(TAG, "$method failed: ${it.message}") }
+        }
+
+    // ── Signing & HTTP ────────────────────────────────────────────────────────
+
+    /**
+     * Generates the Last.fm API method signature.
+     *
+     * Algorithm (from Last.fm docs):
+     *  1. Sort all parameters (excluding "format" and "callback") by key alphabetically.
+     *  2. Concatenate: key1 + value1 + key2 + value2 + … (no separators).
+     *  3. Append the shared secret.
+     *  4. Return lowercase MD5 of the UTF-8 encoded result.
+     */
+    private fun sign(params: Map<String, String>): String {
+        val toSign = params
+            .filterKeys { it != "format" && it != "callback" }
+            .entries
+            .sortedBy { it.key }
+            .joinToString("") { (k, v) -> k + v }
+            .plus(apiSecret)
+        return md5(toSign)
+    }
+
+    private fun md5(input: String): String {
+        val digest = MessageDigest.getInstance("MD5")
+        val bytes  = digest.digest(input.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun postForm(params: Map<String, String>): String {
+        val formBody = FormBody.Builder().apply {
+            params.forEach { (k, v) -> add(k, v) }
+        }.build()
+
+        val request = Request.Builder()
+            .url(BASE_URL)
+            .post(formBody)
+            .addHeader("User-Agent", "Madhu/1.0 (FOSS Android Music Player)")
+            .build()
+
+        val response = okHttpClient.newCall(request).execute()
+        val body     = response.body?.string() ?: ""
+        if (!response.isSuccessful) {
+            Log.w(TAG, "Last.fm HTTP ${response.code}: $body")
+        }
+        return body
+    }
+
+    private fun isReady(): Boolean {
+        if (!enabled)              { Log.v(TAG, "Scrobbling disabled"); return false }
+        if (apiKey.isBlank())      { Log.v(TAG, "API key missing");     return false }
+        if (sessionKey.isBlank())  { Log.v(TAG, "Session key missing"); return false }
+        return true
+    }
+}

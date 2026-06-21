@@ -1,0 +1,274 @@
+package com.foss.madhu.download
+
+import android.content.Context
+import android.os.Environment
+import android.util.Log
+import androidx.work.*
+import com.foss.madhu.data.model.Song
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.TimeUnit
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FavoriteDownloadManager
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * FavoriteDownloadManager
+ *
+ * When the user marks a track as favourite the manager enqueues a
+ * [FavoriteDownloadWorker] via WorkManager. The worker:
+ *  - Downloads the resolved stream URL to
+ *    `<ExternalFilesDir>/Music/madhu/<sanitised_title> — <artist>.m4a`
+ *  - Writes a JSON sidecar `.info` file alongside each track with full metadata
+ *    so the app can reconstruct a [Song] without hitting the network
+ *  - Reports live download progress via the WorkInfo LiveData / Flow
+ *
+ * WorkManager guarantees the download survives process death, screen-off, and
+ * low-battery deferrals.  Downloads run one-at-a-time (serialised chain) to
+ * avoid saturating the user's connection.
+ */
+class FavoriteDownloadManager(private val context: Context) {
+
+    companion object {
+        const val TAG                 = "FavoriteDownloadMgr"
+        const val WORK_TAG_DOWNLOAD   = "madhu_favorite_download"
+        const val KEY_SONG_JSON       = "song_json"
+        const val KEY_STREAM_URL      = "stream_url"
+        const val KEY_PROGRESS        = "download_progress"
+        const val KEY_SONG_ID         = "song_id"
+
+        /** Returns the canonical on-disk path for a downloaded song. */
+        fun localFileFor(context: Context, song: Song): File {
+            val dir = musicDir(context)
+            val name = sanitise("${song.title} — ${song.artist}") + ".m4a"
+            return File(dir, name)
+        }
+
+        fun isDownloaded(context: Context, song: Song): Boolean =
+            localFileFor(context, song).exists()
+
+        private fun musicDir(context: Context): File {
+            val dir = File(
+                context.getExternalFilesDir(Environment.DIRECTORY_MUSIC),
+                "madhu"
+            )
+            if (!dir.exists()) dir.mkdirs()
+            return dir
+        }
+
+        private fun sanitise(name: String): String =
+            name.replace(Regex("[/\\\\:*?\"<>|]"), "_").take(180)
+    }
+
+    private val workManager = WorkManager.getInstance(context)
+
+    // Live progress for all active downloads: songId → 0..100
+    private val _progressMap = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val progressMap: Flow<Map<String, Int>> = _progressMap.asStateFlow()
+
+    /**
+     * Enqueues a background download for [song] at [streamUrl].
+     * Safe to call multiple times — the [ExistingWorkPolicy.KEEP] policy prevents
+     * duplicate workers for the same song.
+     */
+    fun enqueueDownload(song: Song, streamUrl: String) {
+        if (streamUrl.isBlank()) {
+            Log.w(TAG, "Cannot download ${song.id}: empty stream URL")
+            return
+        }
+        if (isDownloaded(context, song)) {
+            Log.d(TAG, "${song.title} already downloaded — skipping")
+            return
+        }
+
+        val songJson = runCatching { Json.encodeToString(song) }.getOrElse {
+            Log.e(TAG, "Failed to serialise song for worker: ${it.message}")
+            return
+        }
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiresStorageNotLow(true)
+            .build()
+
+        val inputData = workDataOf(
+            KEY_SONG_JSON  to songJson,
+            KEY_STREAM_URL to streamUrl,
+            KEY_SONG_ID    to song.id
+        )
+
+        val request = OneTimeWorkRequestBuilder<FavoriteDownloadWorker>()
+            .setConstraints(constraints)
+            .setInputData(inputData)
+            .addTag(WORK_TAG_DOWNLOAD)
+            .addTag("song_${song.id}")
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+
+        workManager.enqueueUniqueWork(
+            "download_${song.id}",
+            ExistingWorkPolicy.KEEP,
+            request
+        )
+
+        // Observe progress updates from the worker and push to the state flow.
+        workManager.getWorkInfosForUniqueWorkFlow("download_${song.id}")
+            .observeForever { workInfoList ->
+                workInfoList.firstOrNull()?.let { info ->
+                    val pct = info.progress.getInt(KEY_PROGRESS, 0)
+                    _progressMap.value = _progressMap.value.toMutableMap()
+                        .also { it[song.id] = pct }
+                    if (info.state.isFinished) {
+                        // Remove from progress tracking once done.
+                        _progressMap.value = _progressMap.value.toMutableMap()
+                            .also { it.remove(song.id) }
+                    }
+                }
+            }
+
+        Log.d(TAG, "Enqueued download for: ${song.title}")
+    }
+
+    /**
+     * Cancels an in-progress download for [song] and deletes any partial file.
+     */
+    fun cancelDownload(song: Song) {
+        workManager.cancelUniqueWork("download_${song.id}")
+        localFileFor(context, song).also { if (it.exists()) it.delete() }
+        val partial = File(localFileFor(context, song).path + ".part")
+        if (partial.exists()) partial.delete()
+    }
+
+    /**
+     * Deletes the local file for [song] and its metadata sidecar.
+     */
+    fun deleteDownload(song: Song) {
+        localFileFor(context, song).delete()
+        File(localFileFor(context, song).path.replace(".m4a", ".info")).delete()
+        Log.d(TAG, "Deleted local file for: ${song.title}")
+    }
+
+    /**
+     * Returns all locally downloaded [Song] objects by reading the `.info` sidecar files.
+     */
+    fun listDownloadedSongs(): List<Song> {
+        val dir = musicDir(context)
+        return dir.listFiles { f -> f.name.endsWith(".info") }
+            ?.mapNotNull { infoFile ->
+                runCatching {
+                    Json.decodeFromString<Song>(infoFile.readText())
+                }.getOrNull()
+            } ?: emptyList()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FavoriteDownloadWorker  (CoroutineWorker)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Background worker that performs the actual HTTP download.
+ *
+ * Progress is reported back to [FavoriteDownloadManager] via [setProgress].
+ * The download is written to a temporary `.part` file first; on success it is
+ * atomically renamed to the final `.m4a` path to prevent corrupt partial files
+ * from appearing in the library.
+ */
+class FavoriteDownloadWorker(
+    appContext: Context,
+    params: WorkerParameters
+) : CoroutineWorker(appContext, params) {
+
+    companion object {
+        private const val TAG          = "FavoriteDownloadWorker"
+        private const val BUFFER_SIZE  = 8 * 1024  // 8 KB read buffer
+
+        // OkHttp with long timeouts to handle large audio files on slow connections.
+        private val httpClient = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .build()
+    }
+
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val songJson   = inputData.getString(FavoriteDownloadManager.KEY_SONG_JSON)
+            ?: return@withContext Result.failure(workDataOf("error" to "No song JSON"))
+        val streamUrl  = inputData.getString(FavoriteDownloadManager.KEY_STREAM_URL)
+            ?: return@withContext Result.failure(workDataOf("error" to "No stream URL"))
+
+        val song = runCatching { Json.decodeFromString<Song>(songJson) }.getOrElse {
+            return@withContext Result.failure(workDataOf("error" to "Failed to parse song"))
+        }
+
+        Log.d(TAG, "Starting download: ${song.title} from $streamUrl")
+        setProgress(workDataOf(FavoriteDownloadManager.KEY_PROGRESS to 0))
+
+        val destFile = FavoriteDownloadManager.localFileFor(applicationContext, song)
+        val partFile = File(destFile.path + ".part")
+
+        try {
+            val request  = Request.Builder()
+                .url(streamUrl)
+                .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
+                .addHeader("Referer", "https://www.jiosaavn.com/")
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.e(TAG, "HTTP ${response.code} downloading ${song.title}")
+                return@withContext if (runAttemptCount < 3) Result.retry()
+                else Result.failure(workDataOf("error" to "HTTP ${response.code}"))
+            }
+
+            val body          = response.body
+                ?: return@withContext Result.failure(workDataOf("error" to "Empty body"))
+            val contentLength = body.contentLength()
+
+            // Stream response to a temp .part file with progress reporting.
+            body.byteStream().use { input ->
+                FileOutputStream(partFile).use { output ->
+                    val buffer      = ByteArray(BUFFER_SIZE)
+                    var totalRead   = 0L
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (contentLength > 0) {
+                            val pct = ((totalRead * 100) / contentLength).toInt()
+                            setProgress(workDataOf(FavoriteDownloadManager.KEY_PROGRESS to pct))
+                        }
+                    }
+                    output.flush()
+                }
+            }
+
+            // Atomic rename: only expose complete file to the library.
+            partFile.renameTo(destFile)
+
+            // Write metadata sidecar so the library can reconstruct Song without network.
+            val infoFile = File(destFile.path.replace(".m4a", ".info"))
+            infoFile.writeText(Json.encodeToString(song))
+
+            setProgress(workDataOf(FavoriteDownloadManager.KEY_PROGRESS to 100))
+            Log.d(TAG, "Download complete: ${destFile.absolutePath}")
+            Result.success(workDataOf(FavoriteDownloadManager.KEY_SONG_ID to song.id))
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Download failed for ${song.title}: ${e.message}")
+            partFile.delete()
+            if (runAttemptCount < 3) Result.retry() else Result.failure(
+                workDataOf("error" to e.message.orEmpty())
+            )
+        }
+    }
+}

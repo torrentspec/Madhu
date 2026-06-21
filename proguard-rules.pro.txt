@@ -1,0 +1,78 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Madhu — ProGuard / R8 Rules
+# Target: sub-5 MB release APK (with Compose + Media3 + OkHttp)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── App data models accessed via reflection (serialization) ───────────────────
+-keep class com.foss.madhu.data.model.** { *; }
+-keepclassmembers class com.foss.madhu.data.model.** { *; }
+
+# ── WorkManager requires concrete worker constructors to survive shrinking ─────
+-keep class * extends androidx.work.Worker { public <init>(android.content.Context, androidx.work.WorkerParameters); }
+-keep class * extends androidx.work.CoroutineWorker { public <init>(android.content.Context, androidx.work.WorkerParameters); }
+
+# ── Media3 / ExoPlayer internal classes that are loaded by name ───────────────
+-keep class androidx.media3.** { *; }
+-dontwarn androidx.media3.**
+-dontwarn com.google.android.exoplayer2.**
+
+# ── Android native audio effects (loaded via JNI reflection) ─────────────────
+-keep class android.media.audiofx.** { *; }
+
+# ── OkHttp ────────────────────────────────────────────────────────────────────
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-keep class okhttp3.internal.publicsuffix.PublicSuffixDatabase { *; }
+-keepnames class okhttp3.** { *; }
+
+# ── kotlinx.serialization ─────────────────────────────────────────────────────
+-keepattributes *Annotation*, InnerClasses
+-dontnote kotlinx.serialization.AnnotationsKt
+-keepclassmembers class kotlinx.serialization.json.** { *** Companion; }
+-keepclasseswithmembers class **$$serializer { *; }
+-keepclassmembers @kotlinx.serialization.Serializable class ** {
+    *** Companion;
+    *** INSTANCE;
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+# ── Coil image loader ─────────────────────────────────────────────────────────
+-keep class coil.** { *; }
+-dontwarn coil.**
+
+# ── DataStore ─────────────────────────────────────────────────────────────────
+-keep class androidx.datastore.** { *; }
+
+# ── Jetpack Compose: reflection used by the Compose compiler plugin ────────────
+-keep class androidx.compose.** { *; }
+-keepclassmembers class androidx.compose.** { *; }
+-dontwarn androidx.compose.**
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+-keep class androidx.palette.** { *; }
+
+# ── Crypto (DES decryption for JioSaavn stream URLs) ──────────────────────────
+-keep class javax.crypto.** { *; }
+-keep class javax.crypto.spec.** { *; }
+
+# ── Kotlin coroutines ─────────────────────────────────────────────────────────
+-keep class kotlinx.coroutines.** { *; }
+-dontwarn kotlinx.coroutines.**
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory { *; }
+-keepnames class kotlinx.coroutines.android.AndroidExceptionPreHandler { *; }
+
+# ── Remove all logging in release ─────────────────────────────────────────────
+-assumenosideeffects class android.util.Log {
+    public static *** v(...);
+    public static *** d(...);
+    public static *** i(...);
+}
+
+# ── Strip Kotlin metadata not needed at runtime ───────────────────────────────
+-dontwarn kotlin.reflect.jvm.**
+
+# ── R8 full-mode optimisations (improves shrinking significantly) ─────────────
+-allowaccessmodification
+-mergeinterfacesaggressively
+-overloadaggressively
+-repackageclasses "m"

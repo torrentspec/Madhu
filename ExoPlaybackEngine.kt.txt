@@ -1,0 +1,512 @@
+package com.foss.madhu.audio
+
+import android.content.Context
+import android.util.Log
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import com.foss.madhu.data.JioSaavnRepository
+import com.foss.madhu.data.model.PlaybackState
+import com.foss.madhu.data.model.Song
+import com.foss.madhu.data.model.StreamQuality
+import com.foss.madhu.prefs.UserPreferences
+import com.foss.madhu.scrobble.LastFmScrobbler
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import okhttp3.OkHttpClient
+
+/**
+ * ExoPlaybackEngine
+ *
+ * Central media-playback coordinator. Owns the single ExoPlayer instance for
+ * the application lifetime and exposes a clean Kotlin-Flow API for UI consumption.
+ *
+ * Responsibilities:
+ *  • ExoPlayer lifecycle (build, prepare, release)
+ *  • Gapless playlist playback via Media3 sequential MediaItems
+ *  • Crossfade: a coroutine monitors position; fades volume out over the last
+ *    [crossfadeMs] ms of every track and fades back in at the start of the next
+ *  • ReplayGain simulation: applies a configurable multiplier to the player
+ *    volume to normalise loudness differences between tracks
+ *  • Bitrate label tracking: derives "NNN kbps • AAC" from the resolved URL
+ *    and the active [StreamQuality] setting
+ *  • Dynamic contextual auto-playlist: when the queue is exhausted, heuristic
+ *    search in JioSaavnRepository builds a new contextual "Up Next" set
+ *  • Last.fm scrobble triggers via [LastFmScrobbler]
+ */
+class ExoPlaybackEngine(
+    private val context: Context,
+    private val repository: JioSaavnRepository,
+    private val prefs: UserPreferences,
+    private val audioEffectManager: AudioEffectManager,
+    private val scrobbler: LastFmScrobbler,
+    okHttpClient: OkHttpClient
+) {
+
+    companion object {
+        private const val TAG             = "ExoPlaybackEngine"
+        private const val POSITION_POLL_MS = 200L      // UI progress update interval
+        private const val MIN_SCROBBLE_PCT  = 50        // Last.fm: scrobble after 50 % played
+
+        // Crossfade steps: 50 ticks × 100 ms = 5 s maximum crossfade window
+        private const val CROSSFADE_TICK_MS = 100L
+    }
+
+    // ── Player ────────────────────────────────────────────────────────────────
+
+    val player: ExoPlayer
+
+    // ── Coroutines ────────────────────────────────────────────────────────────
+
+    private val engineScope   = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var crossfadeJob: Job? = null
+    private var positionJob:  Job? = null
+    private var autoQueueJob: Job? = null
+
+    // ── Runtime config (collected from prefs once and cached) ─────────────────
+
+    @Volatile private var crossfadeMs:       Long  = 3_000L
+    @Volatile private var replayGainFactor:  Float = 0.85f
+    @Volatile private var activeQuality:     StreamQuality = StreamQuality.HI_FIDELITY
+    @Volatile private var crossfadeEnabled:  Boolean = true
+
+    // ── UI-facing state ────────────────────────────────────────────────────────
+
+    private val _playbackState = MutableStateFlow(PlaybackState())
+    val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
+
+    private val _currentBitrateLabel = MutableStateFlow("")
+    val currentBitrateLabel: StateFlow<String> = _currentBitrateLabel.asStateFlow()
+
+    private val _lyrics = MutableStateFlow<com.foss.madhu.data.model.Lyrics?>(null)
+    val lyrics: StateFlow<com.foss.madhu.data.model.Lyrics?> = _lyrics.asStateFlow()
+
+    // ── Internal tracking ─────────────────────────────────────────────────────
+
+    /** The ordered list of songs currently loaded into the player's timeline. */
+    private val queue = mutableListOf<Song>()
+
+    /** Index of the song that was playing when Last.fm "now playing" was sent. */
+    private var scrobbledNowPlayingId: String? = null
+
+    /** Elapsed milliseconds the current track has been actively playing. */
+    private var playedMs: Long = 0L
+    private var playedMsCheckpoint: Long = 0L
+    private var trackStartWallMs: Long = 0L
+
+    init {
+        val dataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
+            .setDefaultRequestProperties(
+                mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K)",
+                    "Referer"    to "https://www.jiosaavn.com/"
+                )
+            )
+
+        val trackSelector = DefaultTrackSelector(context).apply {
+            setParameters(buildUponParameters().setPreferredAudioLanguage("en"))
+        }
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBuffer */ 15_000,
+                /* maxBuffer */ 50_000,
+                /* playbackStart */ 2_500,
+                /* playbackRebuffer */ 5_000
+            )
+            .build()
+
+        player = ExoPlayer.Builder(context)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus = */ true
+            )
+            .setHandleAudioBecomingNoisy(true)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+            .setTrackSelector(trackSelector)
+            .setLoadControl(loadControl)
+            .build()
+            .also { it.addListener(playerListener) }
+
+        collectPrefs()
+        startPositionPoller()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PUBLIC API
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /** Replaces the current queue and starts playback from [startIndex]. */
+    fun playQueue(songs: List<Song>, startIndex: Int = 0) {
+        if (songs.isEmpty()) return
+        engineScope.launch {
+            val urls = resolveStreamUrls(songs)
+            player.stop()
+            player.clearMediaItems()
+            queue.clear()
+
+            songs.forEachIndexed { idx, song ->
+                val url = urls[idx]
+                if (url.isNotEmpty()) {
+                    player.addMediaItem(MediaItem.fromUri(url))
+                    queue.add(song)
+                }
+            }
+            if (queue.isEmpty()) return@launch
+
+            player.seekTo(startIndex.coerceAtMost(queue.lastIndex), 0)
+            player.prepare()
+            player.playWhenReady = true
+        }
+    }
+
+    /** Appends [songs] to the existing queue without interrupting playback. */
+    fun enqueue(songs: List<Song>) {
+        engineScope.launch {
+            val urls = resolveStreamUrls(songs)
+            songs.forEachIndexed { idx, song ->
+                val url = urls[idx]
+                if (url.isNotEmpty()) {
+                    player.addMediaItem(MediaItem.fromUri(url))
+                    queue.add(song)
+                }
+            }
+        }
+    }
+
+    fun play()  { player.play() }
+    fun pause() { player.pause() }
+
+    fun skipToNext() {
+        if (player.hasNextMediaItem()) player.seekToNextMediaItem()
+    }
+
+    fun skipToPrev() {
+        if (player.currentPosition > 3_000) {
+            player.seekTo(0)
+        } else if (player.hasPreviousMediaItem()) {
+            player.seekToPreviousMediaItem()
+        }
+    }
+
+    fun seekTo(positionMs: Long) {
+        player.seekTo(positionMs)
+    }
+
+    /**
+     * Changes the stream quality. The current track is restarted from its current
+     * position using the newly resolved stream URL.
+     */
+    fun setStreamQuality(quality: StreamQuality) {
+        activeQuality = quality
+        val currentSong = currentSong() ?: return
+        val posMs       = player.currentPosition
+
+        engineScope.launch {
+            val url = repository.getStreamUrl(currentSong, quality)
+            if (url.isEmpty()) return@launch
+            updateBitrateLabel(quality)
+            val wasPlaying = player.isPlaying
+            player.pause()
+            val idx = player.currentMediaItemIndex
+            player.replaceMediaItem(idx, MediaItem.fromUri(url))
+            player.prepare()
+            player.seekTo(idx, posMs)
+            if (wasPlaying) player.play()
+        }
+    }
+
+    /**
+     * Applies [factor] as the ReplayGain normalisation multiplier to the player volume.
+     * Factor of 1.0 = 0 dB (unity); 0.5 = −6 dB; 0.85 ≈ −1.4 dB (default).
+     */
+    fun setReplayGainFactor(factor: Float) {
+        replayGainFactor = factor.coerceIn(0.1f, 1.0f)
+        applyVolumeWithGain(targetLinear = 1.0f)
+    }
+
+    fun setCrossfadeDuration(ms: Int) {
+        crossfadeMs      = ms.toLong()
+        crossfadeEnabled = ms > 0
+    }
+
+    /** Fetches lyrics for the currently playing song. */
+    fun loadLyricsForCurrentSong() {
+        val song = currentSong() ?: return
+        if (!song.hasLyrics) { _lyrics.value = null; return }
+        engineScope.launch(Dispatchers.IO) {
+            _lyrics.value = repository.getLyrics(song.lyricsId)
+        }
+    }
+
+    fun release() {
+        engineScope.cancel()
+        audioEffectManager.release()
+        player.release()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Player listener
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private val playerListener = object : Player.Listener {
+
+        override fun onPlaybackStateChanged(state: Int) {
+            updatePlaybackState()
+            when (state) {
+                Player.STATE_READY -> {
+                    // Attach EQ to the new audio session once the player is ready.
+                    audioEffectManager.attach(player.audioSessionId)
+                    startCrossfadeMonitor()
+                }
+                Player.STATE_ENDED -> {
+                    // All queued items finished — generate contextual auto-playlist.
+                    triggerAutoPlaylist()
+                }
+                else -> {}
+            }
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isPlaying) {
+                trackStartWallMs = System.currentTimeMillis()
+            } else {
+                playedMs += System.currentTimeMillis() - trackStartWallMs
+            }
+            updatePlaybackState()
+        }
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            // Cancel any in-progress crossfade; fade back in for new track.
+            crossfadeJob?.cancel()
+            fadeTo(1.0f)
+
+            // Reset per-track scrobble tracking.
+            playedMs    = 0L
+            trackStartWallMs = System.currentTimeMillis()
+
+            val song = currentSong() ?: return
+            updateBitrateLabel(activeQuality)
+            loadLyricsForCurrentSong()
+
+            // Last.fm "Now Playing" update.
+            engineScope.launch(Dispatchers.IO) {
+                scrobbler.updateNowPlaying(song)
+                scrobbledNowPlayingId = song.id
+            }
+
+            updatePlaybackState()
+
+            // Pre-fetch auto-playlist when there is only 1 item remaining.
+            if (player.mediaItemCount - player.currentMediaItemIndex <= 1) {
+                triggerAutoPlaylist()
+            }
+        }
+
+        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+            Log.e(TAG, "Player error: ${error.errorCodeName} — ${error.message}")
+            // Skip to next track on non-fatal playback errors.
+            if (player.hasNextMediaItem()) player.seekToNextMediaItem()
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Crossfade
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Launches a coroutine that polls playback position every [CROSSFADE_TICK_MS].
+     * When the current track has [crossfadeMs] ms remaining, begins a linear
+     * fade-out of the player volume. ExoPlayer's natural track transition then
+     * fires [Player.Listener.onMediaItemTransition] which triggers the fade-in.
+     */
+    private fun startCrossfadeMonitor() {
+        if (!crossfadeEnabled || crossfadeMs <= 0L) return
+        crossfadeJob?.cancel()
+        crossfadeJob = engineScope.launch {
+            while (isActive) {
+                delay(CROSSFADE_TICK_MS)
+                val duration = player.duration
+                val position = player.currentPosition
+                if (duration <= 0 || !player.isPlaying) continue
+
+                val remaining = duration - position
+                if (remaining in 1..crossfadeMs) {
+                    // progress: 0.0 (just entered window) → 1.0 (track ended)
+                    val progress = 1f - (remaining.toFloat() / crossfadeMs)
+                    applyVolumeWithGain(targetLinear = 1f - progress)
+                }
+            }
+        }
+    }
+
+    /** Smooth linear ramp to [targetLinear] over [crossfadeMs] / 2 ms. */
+    private fun fadeTo(targetLinear: Float) {
+        engineScope.launch {
+            val start   = player.volume
+            val steps   = (crossfadeMs / (CROSSFADE_TICK_MS * 2)).coerceAtLeast(1)
+            val delta   = (targetLinear * replayGainFactor - start) / steps
+            repeat(steps.toInt()) {
+                delay(CROSSFADE_TICK_MS)
+                val next = (player.volume + delta).coerceIn(0f, replayGainFactor)
+                player.volume = next
+            }
+            player.volume = targetLinear * replayGainFactor
+        }
+    }
+
+    private fun applyVolumeWithGain(targetLinear: Float) {
+        player.volume = (targetLinear * replayGainFactor).coerceIn(0f, 1f)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Auto-playlist generation
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Heuristic contextual auto-playlist engine.
+     *
+     * Reads the current song's [Song.genre], [Song.language], and [Song.artist]
+     * fields then delegates to [JioSaavnRepository.getSimilarSongs] which in turn:
+     *  1. Calls JioSaavn's native recommendation endpoint.
+     *  2. Falls back to an artist-name search.
+     *  3. Falls back to a genre/language search.
+     *
+     * The resulting candidates are deduplicated against songs already in queue,
+     * shuffled for variety, and appended as the next "Up Next" block.
+     */
+    private fun triggerAutoPlaylist() {
+        autoQueueJob?.cancel()
+        val seed = currentSong() ?: queue.lastOrNull() ?: return
+        autoQueueJob = engineScope.launch(Dispatchers.IO) {
+            Log.d(TAG, "Generating auto-playlist from seed: ${seed.title}")
+            val alreadyQueued = queue.map { it.id }.toSet()
+            val candidates = repository.getSimilarSongs(seed)
+                .filter { it.id !in alreadyQueued }
+                .take(15)
+            if (candidates.isEmpty()) {
+                Log.w(TAG, "Auto-playlist returned no candidates")
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                enqueue(candidates)
+                Log.d(TAG, "Auto-playlist: appended ${candidates.size} songs")
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — Scrobbling
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Scrobbles the current track to Last.fm if ≥ [MIN_SCROBBLE_PCT] of the
+     * track has been played. Called from the position poller on each tick to
+     * catch the threshold crossing.
+     */
+    private fun checkScrobbleThreshold() {
+        val song     = currentSong() ?: return
+        val duration = player.duration
+        if (duration <= 0) return
+
+        val totalPlayedMs = playedMs + if (player.isPlaying) {
+            System.currentTimeMillis() - trackStartWallMs
+        } else 0L
+
+        val pct = (totalPlayedMs.toFloat() / duration * 100).toInt()
+        if (pct >= MIN_SCROBBLE_PCT && scrobbledNowPlayingId == song.id) {
+            engineScope.launch(Dispatchers.IO) {
+                scrobbler.scrobble(song)
+                scrobbledNowPlayingId = null // Prevent duplicate scrobble
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRIVATE — State helpers
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private fun startPositionPoller() {
+        positionJob?.cancel()
+        positionJob = engineScope.launch {
+            while (isActive) {
+                delay(POSITION_POLL_MS)
+                updatePlaybackState()
+                checkScrobbleThreshold()
+            }
+        }
+    }
+
+    private fun updatePlaybackState() {
+        val song = currentSong()
+        _playbackState.value = _playbackState.value.copy(
+            isPlaying   = player.isPlaying,
+            isBuffering = player.playbackState == Player.STATE_BUFFERING,
+            currentSong = song,
+            positionMs  = player.currentPosition.coerceAtLeast(0L),
+            durationMs  = player.duration.coerceAtLeast(0L),
+            currentQuality = activeQuality,
+            bitrateLabel   = _currentBitrateLabel.value,
+            queue        = queue.toList()
+        )
+    }
+
+    private fun updateBitrateLabel(quality: StreamQuality) {
+        val resolved = when (quality) {
+            StreamQuality.AUTO -> {
+                // AUTO quality resolves at runtime; show actual tier selected.
+                when {
+                    activeQuality == StreamQuality.AUTO -> StreamQuality.HI_FIDELITY
+                    else -> activeQuality
+                }
+            }
+            else -> quality
+        }
+        _currentBitrateLabel.value = resolved.bitrateLabel()
+    }
+
+    private fun currentSong(): Song? {
+        val idx = player.currentMediaItemIndex
+        return queue.getOrNull(idx)
+    }
+
+    private suspend fun resolveStreamUrls(songs: List<Song>): List<String> {
+        return songs.map { song ->
+            try {
+                repository.getStreamUrl(song, activeQuality)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resolve URL for ${song.title}: ${e.message}")
+                ""
+            }
+        }
+    }
+
+    private fun collectPrefs() {
+        engineScope.launch {
+            prefs.crossfadeDurationMs.collect { ms ->
+                crossfadeMs     = ms.toLong()
+                crossfadeEnabled = ms > 0
+            }
+        }
+        engineScope.launch {
+            prefs.replayGainFactor.collect { factor ->
+                setReplayGainFactor(factor)
+            }
+        }
+        engineScope.launch {
+            prefs.streamQuality.collect { quality ->
+                activeQuality = quality
+                updateBitrateLabel(quality)
+            }
+        }
+    }
+}
