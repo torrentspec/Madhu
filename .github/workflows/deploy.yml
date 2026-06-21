@@ -22,13 +22,15 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Grant Execute Permission to Gradle Wrapper
-        run: chmod +x gradlew
+      # CRITICAL FIX: Forces the server to generate its own authentic, uncorrupted wrapper
+      - name: Regenerate Authentic Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
 
       - name: Decode and Reconstruct Keystore File
         run: |
           mkdir -p app
-          # The -i flag tells base64 to ignore hidden spaces/newlines from mobile clipboards
           echo "${{ secrets.SIGNING_KEY_BASE64 }}" | base64 --decode -i > app/madhu-release.jks
 
       - name: Build and Optimize Release APK via Gradle
