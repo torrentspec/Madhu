@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.github.com/apk/res/android">
+    <application
+        android:allowBackup="true"
+        android:label="Madhu"
+        android:supportsRtl="true">
+    </application>
+</manifest>
