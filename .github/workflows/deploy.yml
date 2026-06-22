@@ -24,26 +24,26 @@ jobs:
 
       - name: Force-Generate Clean Gradle Wrapper
         run: |
-          # Destroy any lingering corrupted files from previous checkouts
           rm -rf gradle/ gradlew gradlew.bat
-          
-          # Force the cloud server to generate a pristine, uncorrupted binary engine
           gradle wrapper --gradle-version 8.5
           chmod +x gradlew
 
-      - name: Decode and Reconstruct Keystore File
+      - name: Generate Keystore Natively
         run: |
           mkdir -p app
-          echo "${{ secrets.SIGNING_KEY_BASE64 }}" | base64 --decode -i > app/madhu-release.jks
+          # The server creates the Keystore directly, bypassing GitHub Secrets
+          keytool -genkeypair -v \
+            -keystore app/madhu-release.jks \
+            -alias madhu-alias \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass madhupass \
+            -keypass madhupass \
+            -dname "CN=Madhu App, OU=Android, O=Madhu, C=US"
 
       - name: Build Release APK
         run: ./gradlew assembleRelease
 
-      - name: Zipalign and Sign APK Natively
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      - name: Zipalign and Sign APK
         run: |
           BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | sort -V | tail -n 1)
           echo "Using Build Tools from: $BUILD_TOOLS"
@@ -58,17 +58,19 @@ jobs:
           echo "Signing APK..."
           $BUILD_TOOLS/apksigner sign \
             --ks app/madhu-release.jks \
-            --ks-key-alias "$RELEASE_KEY_ALIAS" \
-            --ks-pass pass:"$KEYSTORE_PASSWORD" \
-            --key-pass pass:"$RELEASE_KEY_PASSWORD" \
+            --ks-key-alias "madhu-alias" \
+            --ks-pass pass:"madhupass" \
+            --key-pass pass:"madhupass" \
             --out "$SIGNED_APK" "$ALIGNED_APK"
             
           echo "SIGNED_APK_PATH=$SIGNED_APK" >> $GITHUB_ENV
 
-      - name: Upload Signed Production Build
+      - name: Upload Signed APK and Keystore
         uses: actions/upload-artifact@v4
         with:
-          name: Madhu-Release-Signed-APK
-          path: ${{ env.SIGNED_APK_PATH }}
+          name: Madhu-Release-Artifacts
+          path: |
+            ${{ env.SIGNED_APK_PATH }}
+            app/madhu-release.jks
           if-no-files-found: error
           retention-days: 7
