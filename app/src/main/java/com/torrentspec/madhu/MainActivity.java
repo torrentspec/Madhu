@@ -7,6 +7,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // Empty screen to prevent crashes
+        // This line tells Android to draw the XML file we just created!
+        setContentView(R.layout.activity_main);
     }
 }
